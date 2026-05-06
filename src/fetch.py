@@ -76,3 +76,20 @@ class CoinGeckoClient:
         resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()
+    
+
+def get_price_history(
+    self,
+    coin_id: str,
+    vs_currency: str,
+    start_timestamp: int,
+    end_timestamp: int,
+) -> Dict[str, Any]:
+    """Return raw CoinGecko market_chart JSON for a stablec over a time window"""
+    path = f"/coins/{coin_id}/market_chart/range"
+    params = {
+        "vs_currency": vs_currency,
+        "from": start_timestamp,
+        "to": end_timestamp,
+    }
+    return self._get_json(path, params)
