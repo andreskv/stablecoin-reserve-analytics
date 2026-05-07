@@ -23,18 +23,12 @@ def _make_cache_key(func_name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any
     ).hexdigest()
 
 def _cache_path_for_key(key: str) -> Path:
-    return CACHE_DIR / f"{key}.json"
-
-
-def _cache_path_for_key(key: str) -> Path:
-    """
-    Map a cache key hash to a file path in the cache directory.
-    """
+    # Map a cache key hash to a file path in the cache directory.
     return CACHE_DIR / f"{key}.json"
 
 def cache_response(func: Callable) -> Callable:
     """
-    Decorator that caches the JSON-able return value of an API call to disk.
+    Decorator that caches the JSONable return value of an API call to disk
     """
 
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -58,7 +52,7 @@ def cache_response(func: Callable) -> Callable:
 
 class CoinGeckoClient:
     """
-    Minimal client for the CoinGecko API, focused on historical price data.
+    Minimal client for the CoinGecko API, focused on historical price data
     """
 
     BASE_URL = "https://api.coingecko.com/api/v3"
@@ -70,7 +64,7 @@ class CoinGeckoClient:
     @cache_response
     def _get_json(self, path: str, params: Dict[str, Any]) -> Any:
         """
-        issues a GET request and return parsed JSON, with caching to avoid redundant network calls
+        Issues a GET request and return parsed JSON, with caching to avoid redundant network calls
         """
         url = f"{self.BASE_URL}{path}"
         resp = self.session.get(url, params=params, timeout=30)
