@@ -1,89 +1,190 @@
+"""
+This module is the data-fetching layer of the project. It talks to three
+external services and caches every response on disk, so re-running the
+notebooks does not hammer free tier APIs.
+
+Sources:
+- CoinGecko: daily price for USDC and USDT.
+- DefiLlama
+- Etherscan
+
+Cache:
+All HTTP responses are cached as JSON files under data/raw/api_cache/
+Cache keys are SHA-256 hashes of (function name, arguments).
+
+Usage
+
+-----
+
+"""
+
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable
 
+import pandas as pd
 import requests
 
-# Base directory for cached API responses
+
+# Cache infrastructure
+
+
+# Where cached API responses live
 CACHE_DIR = Path("data") / "raw" / "api_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def _make_cache_key(func_name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
-    key_dict = {
+# Bumping this constant invalidates every cached response without deleting files manually
+
+CACHE_VERSION = "v1"
+
+
+def _make_cache_key(func_name: str, args: tuple, kwargs: dict) -> str:
+    """Hashes a function call into a stable filename safe key."""
+
+    primitive_types = (str, int, float, bool, list, dict, tuple, type(None))
+    if args and not isinstance(args[0], primitive_types):
+        # First arg looks like an instance; replace with the class name
+        stable_args: tuple = (args[0].__class__.__name__,) + args[1:]
+    else:
+        stable_args = args
+
+    payload = {
+        "version": CACHE_VERSION,
         "func": func_name,
-        "args": args,
+        "args": stable_args,
         "kwargs": {k: kwargs[k] for k in sorted(kwargs)},
     }
-    return hashlib.sha256(
-        json.dumps(key_dict, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-def _cache_path_for_key(key: str) -> Path:
-    # Map a cache key hash to a file path in the cache directory.
-    return CACHE_DIR / f"{key}.json"
 
 def cache_response(func: Callable) -> Callable:
     """
-    Decorator that caches the JSONable return value of an API call to disk
+    Decorator: cache the JSON serializable return value of "func" to disk.
+
+    Set "FORCE_REFRESH=1" in the environment to bypass cache reads for a single run; 
+    cache writes still happen so the next run picks up fresh data.
+    Only works for functions whose return value is JSON serializable.
     """
 
+    @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = _make_cache_key(func.__name__, args, kwargs)
-        cache_path = _cache_path_for_key(key)
+        cache_path = CACHE_DIR / f"{key}.json"
 
-        if cache_path.exists():
+        if cache_path.exists() and not os.environ.get("FORCE_REFRESH"):
             with cache_path.open("r", encoding="utf-8") as f:
                 return json.load(f)
 
-        # Cache miss: call the function
         result = func(*args, **kwargs)
-
-        # Persist result to disk
         with cache_path.open("w", encoding="utf-8") as f:
             json.dump(result, f)
-
         return result
 
     return wrapper
 
+
+# CoinGecko client
+
+
+def _timestamp_to_unix(ts: pd.Timestamp) -> int:
+    """Convert a "pd.Timestamp" to a UTC Unix integer, as expected by CoinGecko's API."""
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return int(ts.timestamp())
+
+
 class CoinGeckoClient:
     """
-    Minimal client for the CoinGecko API, focused on historical price data
+    Minimal CoinGecko client for daily price history.
+    Free tier rate-limits at roughly 30 calls per minute; sleep before each request to stay under that limit.
+    Coin IDs:
+        usd-coin — USDC
+        tether   — USDT
     """
 
     BASE_URL = "https://api.coingecko.com/api/v3"
 
-    def __init__(self, session: requests.Session | None = None) -> None:
-        # Uses a shared session for connection pooling. fall back to a new session if not provided
+    def __init__(
+        self,
+        session: requests.Session | None = None,
+        sleep_seconds: float = 2.5,
+    ) -> None:
+        # A shared Session reuses underlying TCP connections across calls, faster than creating a new connection each time.
         self.session = session or requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "stablecoin-reserve-analysis/0.1"}
+        )
+        self.sleep_seconds = sleep_seconds
 
     @cache_response
-    def _get_json(self, path: str, params: Dict[str, Any]) -> Any:
+    def _get_json(self, path: str, params: dict[str, Any]) -> Any:
+        """Issue a GET to CoinGecko and return parsed JSON.
         """
-        Issues a GET request and return parsed JSON, with caching to avoid redundant network calls
-        """
+        time.sleep(self.sleep_seconds)  # polite citizen of the free tier
         url = f"{self.BASE_URL}{path}"
         resp = self.session.get(url, params=params, timeout=30)
-        resp.raise_for_status()
+        resp.raise_for_status()  # raises HTTPError if the response was error
         return resp.json()
-    
 
-def get_price_history(
-    self,
-    coin_id: str,
-    vs_currency: str,
-    start_timestamp: int,
-    end_timestamp: int,
-) -> Dict[str, Any]:
-    """Return raw CoinGecko market_chart JSON for a stablec over a time window"""
-    path = f"/coins/{coin_id}/market_chart/range"
-    params = {
-        "vs_currency": vs_currency,
-        "from": start_timestamp,
-        "to": end_timestamp,
-    }
-    return self._get_json(path, params)
+
+    def get_price_history(
+        self,
+        coin_id: str,
+        vs_currency: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Return daily mean price for "coin_id" over "[start, end]"
+
+        CoinGecko's "market_chart/range" endpoint returns intraday data points whose cadence varies by date range.
+        I aggregate to daily mean as a defensible VWAP proxy at this resolution.
+
+        Parameters
+        ----------
+        coin_id
+            CoinGecko ID, for example "usd-coin" or "tether".
+        vs_currency
+            Pricing currency, for example "usd".
+        start, end
+            Inclusive UTC date bounds for the query.
+
+        Returns
+        -------
+        pd.DataFrame
+            Indexed by date with one column f"price_{coin_id}".
+        """
+        params = {
+            "vs_currency": vs_currency,
+            "from": _timestamp_to_unix(start),
+            "to": _timestamp_to_unix(end),
+        }
+        data = self._get_json(f"/coins/{coin_id}/market_chart/range", params)
+
+        if "prices" not in data or not data["prices"]:
+            raise ValueError(
+                f"CoinGecko returned no price data for "
+                f"{coin_id}/{vs_currency} between {start} and {end}"
+            )
+
+        # CoinGecko returns prices as [[milliseconds_since_epoch, price], ...]
+        prices = pd.DataFrame(data["prices"], columns=["ts_ms", "price"])
+        prices["date"] = (
+            pd.to_datetime(prices["ts_ms"], unit="ms", utc=True).dt.date
+        )
+        daily = (
+            prices.groupby("date", as_index=False)["price"]
+            .mean()
+            .rename(columns={"price": f"price_{coin_id}"})
+        )
+        daily["date"] = pd.to_datetime(daily["date"])
+        return daily.set_index("date").sort_index()

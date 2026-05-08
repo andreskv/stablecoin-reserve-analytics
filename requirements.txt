@@ -1,1 +1,8 @@
-pip install pandas requests python-dotenv
+pandas
+numpy
+requests
+matplotlib
+pdfplumber==0.11.4
+pyarrow
+pytest
+jupyter
