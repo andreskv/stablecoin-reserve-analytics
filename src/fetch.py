@@ -33,11 +33,14 @@ import pandas as pd
 import requests
 
 
-# Cache infrastructure
+# Cache infrastructure --------------------------
 
 
-# Where cached API responses live
-CACHE_DIR = Path("data") / "raw" / "api_cache"
+# Where cached API responses live. Anchored to the repo root (one level up
+# from src/) so notebooks and scripts share the same cache no matter which
+# directory they run from.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = PROJECT_ROOT / "data" / "raw" / "api_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Bumping this constant invalidates every cached response without deleting files manually
